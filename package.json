@@ -1,13 +1,14 @@
 {
-  "scripts": {
-    "voice": "node voice-server.js",
-    "test:voice": "node test-voice-webhooks.js"
-  },
-  "dependencies": {
-    "alawmulaw": "^6.0.0",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "twilio": "^5.12.2",
-    "ws": "^8.18.0"
-  }
+    "scripts": {
+        "dev": "node app.js",
+        "voice": "node app.js",
+        "test:voice": "node test-voice-webhooks.js"
+    },
+    "dependencies": {
+        "alawmulaw": "^6.0.0",
+        "dotenv": "^17.3.1",
+        "express": "^5.2.1",
+        "twilio": "^5.12.2",
+        "ws": "^8.18.0"
+    }
 }
