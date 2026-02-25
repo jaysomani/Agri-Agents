@@ -5,6 +5,8 @@ const http = require("http");
 const { twilioRouter } = require("./Twilio/voice-route");
 const { setupVoiceWebSocket } = require("./Twilio/websocket");
 
+const { sarvamRouter } = require("./Sarvam/sarvam-route");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -12,6 +14,7 @@ app.use(express.urlencoded({ extended: false }));
 app.set("trust proxy", 1);
 
 app.use("/voice", twilioRouter);
+app.use("/sarvam", sarvamRouter);
 
 app.get("/", (req, res) => {
     res.send("Agri-Agents API is running. Voice routes are under /voice.");
