@@ -1,12 +1,19 @@
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
-const { mulawToWav, mulawToPcmBuffer, pcmToWavBuffer } = require("../Utils/Utility");
+const { mulawToWav, mulawToPcmBuffer, pcmToWavBuffer, pcm8kTo16k } = require("../Utils/Utility");
 const { randomUUID } = require("crypto");
 const SarvamAIClient = require("sarvamai").SarvamAIClient;
 const sarvamConfig = require("../Sarvam/sarvam.config");
+const { createNovaSession } = require("../services/nova-sonic.service");
 
 const RAW_AUDIO_DIR = path.join(process.cwd(), "raw-recordings");
+const USE_NOVA_SONIC = process.env.USE_NOVA_SONIC === "true";
+if (USE_NOVA_SONIC && !sarvamConfig.sarvamApiKey) {
+    console.warn(
+        "[Nova Sonic] USE_NOVA_SONIC=true but SARVAM_API_KEY is not set. Sarvam is used for VAD (speech_start/speech_end). Nova will only receive contentEnd when the call stops."
+    );
+}
 fs.mkdirSync(RAW_AUDIO_DIR, { recursive: true });
 
 // ~200ms of 8kHz PCM = 3200 bytes. Twilio sends ~160 bytes/chunk (20ms) = 10 chunks
@@ -16,6 +23,10 @@ const PCM_BYTES_PER_MS = 16; // 8kHz * 2 bytes/sample
 const sarvamClient = sarvamConfig.sarvamApiKey
     ? new SarvamAIClient({ apiSubscriptionKey: sarvamConfig.sarvamApiKey })
     : null;
+
+// ~200ms of 16kHz PCM = 6400 bytes (for Nova Sonic)
+const NOVA_BUFFER_MS = 200;
+const PCM_16K_BYTES_PER_MS = 32; // 16kHz * 2 bytes/sample
 
 function createConnectionState() {
     return {
@@ -33,6 +44,12 @@ function createConnectionState() {
         pcmBuffer: [],
         pcmBufferBytes: 0,
         sarvamHadError: false, // set true on error to prevent reconnect storm
+        // Nova Sonic (when USE_NOVA_SONIC)
+        novaSession: null,
+        novaStream: null,
+        novaPcmBuffer: [],
+        novaPcmBufferBytes: 0,
+        novaContentEndSent: false,
     };
 }
 
@@ -119,8 +136,18 @@ async function connectSarvamStreaming(state) {
                 console.log("   [Sarvam transcript]:", transcript);
             } else if (type === "speech_start") {
                 console.log("   [Sarvam] speech started");
+                // Nova: start new audio content for next utterance (after first)
+                if (USE_NOVA_SONIC && state.novaStream?.isActive && state.novaContentEndSent) {
+                    state.novaStream.startAudioContent();
+                    state.novaContentEndSent = false;
+                }
             } else if (type === "speech_end") {
                 console.log("   [Sarvam] speech ended");
+                if (USE_NOVA_SONIC && state.novaStream?.isActive) {
+                    flushPcmBufferToNova(state);
+                    state.novaStream.endAudioContent();
+                    state.novaContentEndSent = true;
+                }
             }
         });
 
@@ -140,6 +167,51 @@ async function connectSarvamStreaming(state) {
     } catch (err) {
         console.error("   Failed to connect Sarvam streaming:", err?.message || err);
     }
+}
+
+async function connectNovaSonic(state) {
+    if (!USE_NOVA_SONIC) return;
+    try {
+        const { stream } = await createNovaSession({
+            onAudioOutput(audioBytes) {
+                if (state.stopped) return;
+                console.log(
+                    "   [Nova Sonic] received audio blob:",
+                    audioBytes.length,
+                    "bytes (24kHz PCM)"
+                );
+                // Phase 1: log; Phase 3 will send to Twilio
+                const outPath = path.join(
+                    RAW_AUDIO_DIR,
+                    `nova_${state.baseName || state.connectionId}_${Date.now()}.raw`
+                );
+                fs.writeFile(outPath, audioBytes, (err) => {
+                    if (err) console.error("   [Nova] failed to save:", err?.message);
+                });
+            },
+            onTextOutput(data) {
+                if (data?.content) console.log("   [Nova Sonic text]:", data.content);
+            },
+            onError(err) {
+                console.error("   [Nova Sonic error]:", err?.message || err);
+            },
+        });
+        state.novaStream = stream;
+        state.novaSession = { sessionId: stream.sessionId };
+        console.log("   Nova Sonic session started:", stream.sessionId);
+    } catch (err) {
+        console.error("   Failed to start Nova Sonic:", err?.message || err);
+    }
+}
+
+function flushPcmBufferToNova(state) {
+    if (!state.novaStream || !state.novaStream.isActive || state.novaPcmBufferBytes === 0)
+        return;
+    const combined = Buffer.concat(state.novaPcmBuffer);
+    const pcm16k = pcm8kTo16k(combined);
+    state.novaStream.streamAudio(pcm16k);
+    state.novaPcmBuffer = [];
+    state.novaPcmBufferBytes = 0;
 }
 
 function flushPcmBufferToSarvam(state) {
@@ -206,7 +278,9 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
                             "   Media Stream started, Call SID:",
                             state.callSid,
                         );
+                        ensureRawStream(state);
                         connectSarvamStreaming(state);
+                        if (USE_NOVA_SONIC) connectNovaSonic(state);
                         break;
                     case "media":
                         if (msg.media?.payload) {
@@ -220,8 +294,8 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
                             state.totalBytes += mulawChunk.length;
 
                             // Forward to Sarvam streaming: buffer PCM, flush when ready
+                            const pcmChunk = mulawToPcmBuffer(mulawChunk);
                             if (sarvamClient) {
-                                const pcmChunk = mulawToPcmBuffer(mulawChunk);
                                 state.pcmBuffer.push(pcmChunk);
                                 state.pcmBufferBytes += pcmChunk.length;
                                 const bufferMs =
@@ -231,6 +305,16 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
                                     bufferMs >= SARVAM_BUFFER_MS
                                 ) {
                                     flushPcmBufferToSarvam(state);
+                                }
+                            }
+                            // Forward to Nova Sonic: buffer 8k PCM, resample to 16k, flush when ready
+                            if (USE_NOVA_SONIC && state.novaStream?.isActive) {
+                                state.novaPcmBuffer.push(Buffer.from(pcmChunk));
+                                state.novaPcmBufferBytes += pcmChunk.length;
+                                const novaBufferMs =
+                                    (state.novaPcmBufferBytes / PCM_BYTES_PER_MS) | 0;
+                                if (novaBufferMs >= NOVA_BUFFER_MS) {
+                                    flushPcmBufferToNova(state);
                                 }
                             }
                         }
@@ -249,6 +333,15 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
                                 /* ignore close errors */
                             }
                             state.sarvamSocket = null;
+                        }
+
+                        // End Nova Sonic session
+                        if (state.novaStream?.isActive) {
+                            flushPcmBufferToNova(state);
+                            state.novaStream.endSession().catch((e) =>
+                                console.error("   [Nova] endSession error:", e?.message)
+                            );
+                            state.novaStream = null;
                         }
 
                         finalizeAndConvert(state)
@@ -282,7 +375,8 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
         });
 
         ws.on("close", () => {
-            if (!state.stopped && state.rawStream) {
+            state.stopped = true;
+            if (state.rawStream) {
                 state.rawStream.end();
                 if (state.rawPath) {
                     fs.promises.unlink(state.rawPath).catch(() => {});
@@ -295,6 +389,10 @@ function setupVoiceWebSocket(server, { wsPath = "/voice/stream" } = {}) {
                     /* ignore */
                 }
                 state.sarvamSocket = null;
+            }
+            if (state.novaStream?.isActive) {
+                state.novaStream.endSession().catch(() => {});
+                state.novaStream = null;
             }
             console.log("WebSocket closed");
         });
