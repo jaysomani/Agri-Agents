@@ -15,7 +15,7 @@ fs.mkdirSync(RAW_AUDIO_DIR, { recursive: true });
 const SARVAM_BUFFER_MS = 200;
 const PCM_BYTES_PER_MS = 16; // 8kHz * 2 bytes/sample
 // After this much silence (no new transcript), assume user finished speaking and trigger pipeline
-const SILENCE_TRIGGER_MS = 1200;
+const SILENCE_TRIGGER_MS = 2000;
 
 // Start TTS when we have this many words from LLM (reduces time-to-first-audio)
 const TTS_FIRST_CHUNK_WORDS = 15;
