@@ -1,7 +1,7 @@
 {
     "scripts": {
         "dev": "node app.js",
-        "voice": "node app.js",
+        "start": "node app.js",
         "test:voice": "node test-voice-webhooks.js"
     },
     "dependencies": {
