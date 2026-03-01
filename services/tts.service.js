@@ -9,6 +9,23 @@ const SarvamAIClient = require("sarvamai").SarvamAIClient;
 const SAMPLE_RATE = 8000; // Twilio expects 8kHz
 const DEFAULT_LANGUAGE = "en-IN";
 const MIN_TTS_WORDS = 5;
+
+/** Detect Sarvam TTS language code from text script (Unicode ranges) */
+function detectLanguageFromText(text) {
+    if (!text || typeof text !== "string") return DEFAULT_LANGUAGE;
+    const t = text.trim();
+    if (!t) return DEFAULT_LANGUAGE;
+    if (/[\u0B80-\u0BFF]/.test(t)) return "ta-IN";
+    if (/[\u0C00-\u0C7F]/.test(t)) return "te-IN";
+    if (/[\u0C80-\u0CFF]/.test(t)) return "kn-IN";
+    if (/[\u0D00-\u0D7F]/.test(t)) return "ml-IN";
+    if (/[\u0980-\u09FF]/.test(t)) return "bn-IN";
+    if (/[\u0A80-\u0AFF]/.test(t)) return "gu-IN";
+    if (/[\u0A00-\u0A7F]/.test(t)) return "pa-IN";
+    if (/[\u0B00-\u0B7F]/.test(t)) return "od-IN";
+    if (/[\u0900-\u097F]/.test(t)) return "hi-IN";
+    return DEFAULT_LANGUAGE;
+}
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 500;
 
@@ -89,4 +106,5 @@ async function textToSpeech(text, languageCode = DEFAULT_LANGUAGE) {
 
 module.exports = {
     textToSpeech,
+    detectLanguageFromText,
 };
