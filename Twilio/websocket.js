@@ -6,7 +6,7 @@ const { randomUUID } = require("crypto");
 const SarvamAIClient = require("sarvamai").SarvamAIClient;
 const sarvamConfig = require("../Sarvam/sarvam.config");
 const { generateResponseStream } = require("../services/llm.service");
-const { textToSpeech } = require("../services/tts.service");
+const { textToSpeech, detectLanguageFromText } = require("../services/tts.service");
 
 const RAW_AUDIO_DIR = path.join(process.cwd(), "raw-recordings");
 fs.mkdirSync(RAW_AUDIO_DIR, { recursive: true });
@@ -25,7 +25,7 @@ const TTS_MIN_WORDS = 5;
 // Filler/short utterances - do not send to LLM (saves cost, avoids ghost replies)
 const FILLER_WORDS = new Set([
     "okay", "ok", "hm", "hmm", "haan", "han", "yes", "no", "right", "aha",
-    "uh", "um", "oh", "sure", "alright", "good", "fine", "thanks", "thank you",
+    "uh", "um", "oh", "sure", "alright", "good", "fine",
 ]);
 const MIN_UTTERANCE_LENGTH = 8;
 
@@ -74,6 +74,9 @@ function createConnectionState() {
         transcripts: [], // accumulate all transcripts; use longest on stop
         silenceTimer: null,
         pipelineProcessing: false,
+        userInterrupted: false,
+        pipelineAbortController: null,
+        segmentQueue: null,
     };
 }
 
@@ -142,7 +145,7 @@ async function playWelcome(state) {
     if (!state.streamSid || state.stopped) return;
     try {
         const welcomeText = "Welcome to Agri Agents. Please tell me your question.";
-        const audioBuffer = await textToSpeech(welcomeText);
+        const audioBuffer = await textToSpeech(welcomeText, detectLanguageFromText(welcomeText));
         if (!audioBuffer || state.stopped) return;
         const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
         const BYTES_PER_CHUNK = (8000 * 2 * 20) / 1000;
@@ -153,6 +156,16 @@ async function playWelcome(state) {
         console.log("   [Welcome] played to caller");
     } catch (err) {
         console.error("   [Welcome] TTS error:", err?.message);
+    }
+}
+
+function sendClearToCaller(state) {
+    if (!state.ws || state.ws.readyState !== 1 || !state.streamSid) return;
+    try {
+        state.ws.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
+        console.log("   [Barge-in] cleared audio buffer");
+    } catch (err) {
+        console.error("   [Barge-in] clear error:", err?.message);
     }
 }
 
@@ -176,6 +189,7 @@ function sendAudioToCaller(state, pcmBuffer) {
  * On speech_end, silence timeout, or Sarvam close fallback: send transcript to LLM, TTS, play to caller.
  */
 async function handleUserUtterance(state, transcript) {
+    state.userInterrupted = false;
     console.log("   [Pipeline Step 0] handleUserUtterance called, transcript length:", transcript?.length ?? 0);
     if (state.stopped || !transcript?.trim()) {
         console.log("   [Pipeline Step 0] SKIP - stopped:", state.stopped, "empty:", !transcript?.trim());
@@ -188,9 +202,16 @@ async function handleUserUtterance(state, transcript) {
     state.conversationHistory.push({ role: "user", content: userMessage });
     console.log("   [Pipeline Step 2] Added to history, count:", state.conversationHistory.length);
 
-    const abortSignal = state.abortController?.signal;
+    state.pipelineAbortController = new AbortController();
+    const mergedAbort = new AbortController();
+    [state.abortController?.signal, state.pipelineAbortController?.signal].forEach((sig) => {
+        if (sig) sig.addEventListener("abort", () => mergedAbort.abort());
+    });
+    const abortSignal = mergedAbort.signal;
+
     let fullResponse = "";
     const segmentQueue = [];
+    state.segmentQueue = segmentQueue;
     let streamDone = false;
 
     function extractSegment(buffer) {
@@ -211,16 +232,16 @@ async function handleUserUtterance(state, transcript) {
 
     async function ttsConsumer() {
         while (!streamDone || segmentQueue.length > 0) {
-            if (state.stopped) break;
+            if (state.stopped || state.userInterrupted) break;
             if (segmentQueue.length > 0) {
                 const seg = cleanOrphanedChars(segmentQueue.shift());
                 if (seg) {
-                    const audioBuffer = await textToSpeech(seg);
-                    if (audioBuffer && state.ws && state.ws.readyState === 1 && state.streamSid && !state.stopped) {
+                    const audioBuffer = await textToSpeech(seg, detectLanguageFromText(seg));
+                    if (audioBuffer && state.ws && state.ws.readyState === 1 && state.streamSid && !state.stopped && !state.userInterrupted) {
                         const CHUNK_MS = 20;
                         const BYTES_PER_CHUNK = (8000 * 2 * CHUNK_MS) / 1000;
                         const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
-                        for (let j = 0; j < buf.length && !state.stopped; j += BYTES_PER_CHUNK) {
+                        for (let j = 0; j < buf.length && !state.stopped && !state.userInterrupted; j += BYTES_PER_CHUNK) {
                             sendAudioToCaller(state, buf.subarray(j, Math.min(j + BYTES_PER_CHUNK, buf.length)));
                         }
                     }
@@ -237,7 +258,7 @@ async function handleUserUtterance(state, transcript) {
 
         let buffer = "";
         for await (const chunk of generateResponseStream(userMessage, state.conversationHistory, abortSignal)) {
-            if (state.stopped) break;
+            if (state.stopped || state.userInterrupted) break;
             fullResponse += chunk;
             buffer += chunk;
             for (;;) {
@@ -248,10 +269,10 @@ async function handleUserUtterance(state, transcript) {
             }
         }
 
-        if (state.stopped) {
+        if (state.stopped || state.userInterrupted) {
             streamDone = true;
             await consumerPromise;
-            console.log("   [Pipeline Step 3] ABORTED - call ended during LLM");
+            console.log("   [Pipeline Step 3] ABORTED -", state.userInterrupted ? "user interrupted" : "call ended");
             state.conversationHistory.pop();
             return;
         }
@@ -275,8 +296,8 @@ async function handleUserUtterance(state, transcript) {
     }
 
     const assistantMessage = cleanOrphanedChars(fullResponse);
-    if (!assistantMessage || state.stopped) {
-        console.log("   [Pipeline Step 4] SKIP - empty or stopped");
+    if (!assistantMessage || state.stopped || state.userInterrupted) {
+        console.log("   [Pipeline Step 4] SKIP - empty, stopped, or interrupted");
         return;
     }
     console.log("   [Pipeline Step 4] Assistant:", assistantMessage);
@@ -355,7 +376,14 @@ async function connectSarvamStreaming(state) {
                 state.lastTranscript = transcript;
                 state.transcripts.push(transcript);
                 console.log("   [Sarvam transcript]:", transcript);
-                // Reset silence timer: after SILENCE_TRIGGER_MS with no new transcript, run pipeline (user still on call)
+
+                if (state.pipelineProcessing) {
+                    state.userInterrupted = true;
+                    sendClearToCaller(state);
+                    if (state.pipelineAbortController) state.pipelineAbortController.abort();
+                    if (state.segmentQueue) state.segmentQueue.length = 0;
+                }
+
                 clearSilenceTimer(state);
                 if (!state.stopped && !state.pipelineProcessing) {
                     state.silenceTimer = setTimeout(() => triggerPipelineFromSilence(state), SILENCE_TRIGGER_MS);
