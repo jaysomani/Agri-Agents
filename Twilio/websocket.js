@@ -29,6 +29,15 @@ const FILLER_WORDS = new Set([
 ]);
 const MIN_UTTERANCE_LENGTH = 8;
 
+/** Strip orphaned Devanagari/Unicode combining chars when stream cuts mid-character */
+function cleanOrphanedChars(text) {
+    if (!text || typeof text !== "string") return text;
+    return text
+        .replace(/\p{M}+$/gu, "")
+        .replace(/\s+$/g, "")
+        .trim();
+}
+
 const sarvamClient = sarvamConfig.sarvamApiKey
     ? new SarvamAIClient({ apiSubscriptionKey: sarvamConfig.sarvamApiKey })
     : null;
@@ -181,39 +190,80 @@ async function handleUserUtterance(state, transcript) {
 
     const abortSignal = state.abortController?.signal;
     let fullResponse = "";
-    const ttsSegments = [];
+    const segmentQueue = [];
+    let streamDone = false;
+
+    function extractSegment(buffer) {
+        const trimmed = buffer.trim();
+        const words = trimmed.split(/\s+/).filter(Boolean);
+        const sentMatch = trimmed.match(/^(.+?[.!?])\s+/s);
+        const segment = sentMatch
+            ? sentMatch[1].trim()
+            : words.length >= TTS_FIRST_CHUNK_WORDS
+                ? words.slice(0, TTS_FIRST_CHUNK_WORDS).join(" ")
+                : null;
+        if (!segment) return { segment: null, remainder: buffer };
+        const segWords = segment.split(/\s+/).filter(Boolean).length;
+        if (segWords < TTS_MIN_WORDS) return { segment: null, remainder: buffer };
+        const remainder = sentMatch ? trimmed.slice(sentMatch[0].length) : words.slice(TTS_FIRST_CHUNK_WORDS).join(" ");
+        return { segment, remainder };
+    }
+
+    async function ttsConsumer() {
+        while (!streamDone || segmentQueue.length > 0) {
+            if (state.stopped) break;
+            if (segmentQueue.length > 0) {
+                const seg = cleanOrphanedChars(segmentQueue.shift());
+                if (seg) {
+                    const audioBuffer = await textToSpeech(seg);
+                    if (audioBuffer && state.ws && state.ws.readyState === 1 && state.streamSid && !state.stopped) {
+                        const CHUNK_MS = 20;
+                        const BYTES_PER_CHUNK = (8000 * 2 * CHUNK_MS) / 1000;
+                        const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+                        for (let j = 0; j < buf.length && !state.stopped; j += BYTES_PER_CHUNK) {
+                            sendAudioToCaller(state, buf.subarray(j, Math.min(j + BYTES_PER_CHUNK, buf.length)));
+                        }
+                    }
+                }
+            } else {
+                await new Promise((r) => setTimeout(r, 20));
+            }
+        }
+    }
+
     try {
         console.log("   [Pipeline Step 3] Calling Bedrock LLM (generateResponseStream)...");
+        const consumerPromise = ttsConsumer();
+
         let buffer = "";
         for await (const chunk of generateResponseStream(userMessage, state.conversationHistory, abortSignal)) {
             if (state.stopped) break;
             fullResponse += chunk;
             buffer += chunk;
             for (;;) {
-                const trimmed = buffer.trim();
-                const words = trimmed.split(/\s+/).filter(Boolean);
-                const sentMatch = trimmed.match(/^(.+?[.!?])\s+/s);
-                const segment = sentMatch
-                    ? sentMatch[1].trim()
-                    : words.length >= TTS_FIRST_CHUNK_WORDS
-                        ? words.slice(0, TTS_FIRST_CHUNK_WORDS).join(" ")
-                        : null;
+                const { segment, remainder } = extractSegment(buffer);
                 if (!segment) break;
-                const segWords = segment.split(/\s+/).filter(Boolean).length;
-                if (segWords >= TTS_MIN_WORDS) ttsSegments.push(segment);
-                buffer = sentMatch ? trimmed.slice(sentMatch[0].length) : words.slice(TTS_FIRST_CHUNK_WORDS).join(" ");
+                segmentQueue.push(segment);
+                buffer = remainder;
             }
         }
+
         if (state.stopped) {
+            streamDone = true;
+            await consumerPromise;
             console.log("   [Pipeline Step 3] ABORTED - call ended during LLM");
             state.conversationHistory.pop();
             return;
         }
+
         const remainder = buffer.trim();
-        if (remainder && remainder.split(/\s+/).filter(Boolean).length >= TTS_MIN_WORDS) ttsSegments.push(remainder);
-        if (ttsSegments.length === 0 && fullResponse.trim()) ttsSegments.push(fullResponse.trim());
-        console.log("   [Pipeline Step 3] LLM done, response length:", fullResponse.length, "| TTS chunks:", ttsSegments.length);
+        if (remainder && remainder.split(/\s+/).filter(Boolean).length >= TTS_MIN_WORDS) segmentQueue.push(remainder);
+        if (segmentQueue.length === 0 && fullResponse.trim()) segmentQueue.push(cleanOrphanedChars(fullResponse));
+        streamDone = true;
+        await consumerPromise;
+        console.log("   [Pipeline Step 3] LLM done, response length:", fullResponse.length);
     } catch (err) {
+        streamDone = true;
         if (err?.name === "AbortError") {
             console.log("   [Pipeline Step 3] ABORTED");
             state.conversationHistory.pop();
@@ -224,31 +274,14 @@ async function handleUserUtterance(state, transcript) {
         return;
     }
 
-    const assistantMessage = fullResponse.trim();
+    const assistantMessage = cleanOrphanedChars(fullResponse);
     if (!assistantMessage || state.stopped) {
         console.log("   [Pipeline Step 4] SKIP - empty or stopped");
         return;
     }
     console.log("   [Pipeline Step 4] Assistant:", assistantMessage);
     state.conversationHistory.push({ role: "assistant", content: assistantMessage });
-
-    try {
-        for (let i = 0; i < ttsSegments.length && !state.stopped; i++) {
-            const audioBuffer = await textToSpeech(ttsSegments[i]);
-            if (audioBuffer && state.ws && state.ws.readyState === 1 && state.streamSid && !state.stopped) {
-                const CHUNK_MS = 20;
-                const BYTES_PER_CHUNK = (8000 * 2 * CHUNK_MS) / 1000;
-                const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
-                for (let j = 0; j < buf.length && !state.stopped; j += BYTES_PER_CHUNK) {
-                    const chunk = buf.subarray(j, Math.min(j + BYTES_PER_CHUNK, buf.length));
-                    sendAudioToCaller(state, chunk);
-                }
-            }
-        }
-        console.log("   [Pipeline Step 5] Played TTS to caller");
-    } catch (err) {
-        console.error("   [Pipeline Step 5] TTS Error:", err?.message || err);
-    }
+    console.log("   [Pipeline Step 5] Played TTS to caller");
 }
 
 async function connectSarvamStreaming(state) {

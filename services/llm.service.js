@@ -59,7 +59,7 @@ async function* generateResponseStream(userMessage, conversationHistory = [], ab
         messages,
         system: [{ text: SYSTEM_PROMPT }],
         inferenceConfig: {
-            maxTokens: 120,
+            maxTokens: 180,
             temperature: 0.2,
             topP: 0.7,
         },
