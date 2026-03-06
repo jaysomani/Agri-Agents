@@ -190,17 +190,14 @@ function sendAudioToCaller(state, pcmBuffer) {
  */
 async function handleUserUtterance(state, transcript) {
     state.userInterrupted = false;
-    console.log("   [Pipeline Step 0] handleUserUtterance called, transcript length:", transcript?.length ?? 0);
     if (state.stopped || !transcript?.trim()) {
         console.log("   [Pipeline Step 0] SKIP - stopped:", state.stopped, "empty:", !transcript?.trim());
         return;
     }
 
     const userMessage = transcript.trim();
-    console.log("   [Pipeline Step 1] User message:", userMessage);
 
     state.conversationHistory.push({ role: "user", content: userMessage });
-    console.log("   [Pipeline Step 2] Added to history, count:", state.conversationHistory.length);
 
     state.pipelineAbortController = new AbortController();
     const mergedAbort = new AbortController();
@@ -253,7 +250,7 @@ async function handleUserUtterance(state, transcript) {
     }
 
     try {
-        console.log("   [Pipeline Step 3] Calling Bedrock LLM (generateResponseStream)...");
+        console.log("   [Pipeline Step 2] Calling Bedrock LLM (generateResponseStream)...");
         const consumerPromise = ttsConsumer();
 
         let buffer = "";
@@ -272,7 +269,7 @@ async function handleUserUtterance(state, transcript) {
         if (state.stopped || state.userInterrupted) {
             streamDone = true;
             await consumerPromise;
-            console.log("   [Pipeline Step 3] ABORTED -", state.userInterrupted ? "user interrupted" : "call ended");
+            console.log("   [Pipeline error] ABORTED -", state.userInterrupted ? "user interrupted" : "call ended");
             state.conversationHistory.pop();
             return;
         }
@@ -282,7 +279,7 @@ async function handleUserUtterance(state, transcript) {
         if (segmentQueue.length === 0 && fullResponse.trim()) segmentQueue.push(cleanOrphanedChars(fullResponse));
         streamDone = true;
         await consumerPromise;
-        console.log("   [Pipeline Step 3] LLM done, response length:", fullResponse.length);
+        
     } catch (err) {
         streamDone = true;
         if (err?.name === "AbortError") {
@@ -361,10 +358,6 @@ async function connectSarvamStreaming(state) {
         socket.on("message", (data) => {
             const msg = typeof data === "string" ? JSON.parse(data) : data;
             const type = msg?.type;
-            // Debug: log every message type to see what Sarvam sends
-            if (type && !["transcript", "final_transcript"].includes(type)) {
-                console.log("   [Sarvam msg] type:", type, "keys:", Object.keys(msg || {}).join(", "));
-            }
             if (type === "error") {
                 state.sarvamHadError = true;
                 console.error("   [Sarvam error]:", msg?.data?.message ?? msg);
